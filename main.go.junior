@@ -1,0 +1,598 @@
+package main
+
+import (
+	"errors"
+	"log"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/joho/godotenv"
+	"golang.org/x/crypto/bcrypt"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+)
+
+// ============================================================
+// BAGIAN 1: MODEL DATABASE
+// Struct ini merepresentasikan tabel "users" di PostgreSQL
+// Tag `gorm:"..."` = instruksi untuk GORM
+// Tag `json:"..."` = nama field saat dikirim sebagai response JSON
+// ============================================================
+
+type User struct {
+	ID        uint           `gorm:"primaryKey"      json:"id"`
+	Name      string         `gorm:"not null"        json:"name"`
+	Email     string         `gorm:"unique;not null" json:"email"`
+	Password  string         `gorm:"not null"        json:"-"` // json:"-" → tidak ikut tampil di response
+	CreatedAt time.Time      `                       json:"created_at"`
+	UpdatedAt time.Time      `                       json:"updated_at"`
+	DeletedAt gorm.DeletedAt `gorm:"index"           json:"-"`
+}
+
+// ============================================================
+// BAGIAN 2: STRUCT INPUT
+// Digunakan untuk menerima & memvalidasi data dari request body
+// Tag `validate:"required"` = wajib diisi
+// ============================================================
+
+type RegisterInput struct {
+	Name     string `json:"name"     validate:"required,min=2"`
+	Email    string `json:"email"    validate:"required,email"`
+	Password string `json:"password" validate:"required,min=6"`
+}
+
+type LoginInput struct {
+	Email    string `json:"email"    validate:"required"`
+	Password string `json:"password" validate:"required"`
+}
+
+// ============================================================
+// BAGIAN 3: TOKEN BLACKLIST
+//
+// Masalah JWT: Setelah logout, token lama masih valid sampai expired
+// karena JWT bersifat "stateless" (server tidak simpan state login).
+//
+// Solusi: Simpan token yang sudah di-logout ke dalam "daftar hitam".
+// Setiap request ke endpoint privat, cek dulu apakah tokennya ada
+// di daftar hitam. Jika ada → tolak akses.
+//
+// sync.RWMutex digunakan agar aman diakses oleh banyak request
+// secara bersamaan (concurrent-safe).
+// ============================================================
+
+type TokenBlacklist struct {
+	mu     sync.RWMutex       // Kunci agar tidak ada race condition
+	tokens map[string]int64   // map[tokenString]waktu_expired (Unix timestamp)
+}
+
+// Tambahkan token ke daftar hitam
+func (tb *TokenBlacklist) Add(token string, expiredAt int64) {
+	tb.mu.Lock()         // Kunci untuk write
+	defer tb.mu.Unlock() // Buka kunci setelah selesai
+	tb.tokens[token] = expiredAt
+}
+
+// Cek apakah token ada di daftar hitam
+func (tb *TokenBlacklist) IsBlacklisted(token string) bool {
+	tb.mu.RLock()         // Kunci untuk read (bisa bersamaan)
+	defer tb.mu.RUnlock()
+	_, exists := tb.tokens[token]
+	return exists
+}
+
+// Bersihkan token yang sudah expired dari memori (agar tidak boros RAM)
+func (tb *TokenBlacklist) Cleanup() {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	now := time.Now().Unix()
+	for token, expiredAt := range tb.tokens {
+		if now > expiredAt {
+			delete(tb.tokens, token)
+		}
+	}
+}
+
+// ============================================================
+// BAGIAN 4: VARIABEL GLOBAL
+// Variabel ini bisa diakses dari semua fungsi di file ini
+// ============================================================
+
+var (
+	DB         *gorm.DB
+	jwtSecret  []byte
+	blacklist  = &TokenBlacklist{tokens: make(map[string]int64)}
+)
+
+// ============================================================
+// BAGIAN 5: KONEKSI DATABASE
+// ============================================================
+
+func connectDatabase() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "host=localhost user=postgres password=102938 dbname=belajar-api port=5432 sslmode=disable"
+	}
+
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		log.Fatal("❌ Gagal konek ke database:", err)
+	}
+
+	// AutoMigrate: buat/update tabel otomatis sesuai struct User
+	if err := db.AutoMigrate(&User{}); err != nil {
+		log.Fatal("❌ Gagal migrasi database:", err)
+	}
+
+	DB = db
+	log.Println("✅ Database berhasil terhubung!")
+}
+
+// ============================================================
+// BAGIAN 6: FUNGSI JWT
+//
+// JWT = JSON Web Token
+// Cara kerja: saat login → buat token → kirim ke user
+// Token berisi: user_id, waktu expired, dan "jti" (ID unik token)
+// Setiap request privat → user kirim token → server verifikasi
+// ============================================================
+
+func generateToken(userID uint) (string, int64, error) {
+	expiredAt := time.Now().Add(24 * time.Hour).Unix() // Token berlaku 24 jam
+
+	claims := jwt.MapClaims{
+		"user_id": userID,
+		"exp":     expiredAt,
+		"iat":     time.Now().Unix(), // Waktu dibuat
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString(jwtSecret)
+
+	return tokenString, expiredAt, err
+}
+
+func parseToken(tokenString string) (jwt.MapClaims, error) {
+	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
+		// Pastikan algoritma yang digunakan adalah HMAC (HS256)
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fiber.ErrUnauthorized
+		}
+		return jwtSecret, nil
+	})
+
+	if err != nil || !token.Valid {
+		return nil, errors.New("token tidak valid atau sudah kadaluarsa")
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return nil, errors.New("token rusak")
+	}
+
+	return claims, nil
+}
+
+// ============================================================
+// BAGIAN 7: MIDDLEWARE AUTENTIKASI (PENJAGA AKSES)
+//
+// Middleware berjalan SEBELUM handler utama.
+// Tugasnya:
+//   1. Cek apakah ada token di header Authorization
+//   2. Cek apakah token ada di blacklist (sudah logout)  ← SOLUSI MASALAH LOGOUT
+//   3. Verifikasi token valid dan belum expired
+//   4. Simpan user_id ke context agar bisa dipakai handler
+// ============================================================
+
+func authMiddleware(c *fiber.Ctx) error {
+	// Ambil token dari header: "Authorization: Bearer <token>"
+	authHeader := c.Get("Authorization")
+	if authHeader == "" {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
+			"success": false,
+			"message": "Token tidak ditemukan. Silakan login terlebih dahulu.",
+		})
+	}
+
+	// Hapus prefix "Bearer " untuk mendapatkan token murni
+	tokenString := ""
+	if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
+		tokenString = authHeader[7:]
+	} else {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
+			"success": false,
+			"message": "Format token salah. Gunakan: Bearer <token>",
+		})
+	}
+
+	// ✅ SOLUSI MASALAH LOGOUT:
+	// Cek apakah token ini sudah dimasukkan ke blacklist (artinya sudah logout)
+	if blacklist.IsBlacklisted(tokenString) {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
+			"success": false,
+			"message": "Token sudah tidak berlaku. Silakan login ulang.",
+		})
+	}
+
+	// Verifikasi dan parse token
+	claims, err := parseToken(tokenString)
+	if err != nil {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
+			"success": false,
+			"message": err.Error(),
+		})
+	}
+
+	// Simpan data ke context Fiber agar bisa diakses oleh handler berikutnya
+	c.Locals("user_id", uint(claims["user_id"].(float64)))
+	c.Locals("token", tokenString)                     // Simpan token untuk keperluan logout
+	c.Locals("token_exp", int64(claims["exp"].(float64))) // Simpan waktu expired
+
+	return c.Next() // Lanjut ke handler
+}
+
+// ============================================================
+// BAGIAN 8: HELPER FUNGSI
+// Fungsi kecil yang dipakai berulang kali
+// ============================================================
+
+// Ambil raw token string dari header Authorization
+func extractToken(c *fiber.Ctx) string {
+	authHeader := c.Get("Authorization")
+	if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
+		return authHeader[7:]
+	}
+	return ""
+}
+
+// ============================================================
+// BAGIAN 9: HANDLER - REGISTER
+//
+// Endpoint : POST /api/register
+// Akses    : Publik (tidak perlu token)
+// Body     : { "name": "...", "email": "...", "password": "..." }
+// ============================================================
+
+func register(c *fiber.Ctx) error {
+	var input RegisterInput
+
+	// Parse body JSON ke struct RegisterInput
+	if err := c.BodyParser(&input); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"message": "Format body tidak valid. Pastikan mengirim JSON.",
+		})
+	}
+
+	// Validasi manual (karena Fiber tidak auto-validate)
+	if input.Name == "" || len(input.Name) < 2 {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"message": "Nama wajib diisi dan minimal 2 karakter.",
+		})
+	}
+	if input.Email == "" {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"message": "Email wajib diisi.",
+		})
+	}
+	if len(input.Password) < 6 {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"message": "Password minimal 6 karakter.",
+		})
+	}
+
+	// Cek apakah email sudah terdaftar (termasuk yang soft-deleted)
+	var existingUser User
+	result := DB.Unscoped().Where("email = ?", input.Email).First(&existingUser)
+
+	if result.Error == nil {
+		// User ditemukan
+		if existingUser.DeletedAt.Valid {
+			// Email pernah terdaftar tapi sudah dihapus (soft-deleted)
+			// Hapus permanen agar bisa daftar ulang dengan email yang sama
+			DB.Unscoped().Delete(&existingUser)
+		} else {
+			// Email masih aktif terdaftar
+			return c.Status(http.StatusConflict).JSON(fiber.Map{
+				"success": false,
+				"message": "Email sudah terdaftar. Gunakan email lain atau login.",
+			})
+		}
+	} else if !errors.Is(result.Error, gorm.ErrRecordNotFound) {
+		// Ada error lain selain "tidak ditemukan"
+		log.Println("❌ DB Error:", result.Error)
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"message": "Terjadi kesalahan server.",
+		})
+	}
+
+	// Hash password sebelum disimpan
+	// bcrypt mengubah "password123" → "$2a$10$randomhash..."
+	// Tidak bisa di-decode balik → aman!
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"message": "Gagal memproses password.",
+		})
+	}
+
+	// Buat dan simpan user baru ke database
+	user := User{
+		Name:     input.Name,
+		Email:    input.Email,
+		Password: string(hashedPassword),
+	}
+
+	if err := DB.Create(&user).Error; err != nil {
+		log.Println("❌ Gagal create user:", err)
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"message": "Gagal mendaftarkan user.",
+		})
+	}
+
+	return c.Status(http.StatusCreated).JSON(fiber.Map{
+		"success": true,
+		"message": "Registrasi berhasil! Silakan login.",
+		"data": fiber.Map{
+			"id":    user.ID,
+			"name":  user.Name,
+			"email": user.Email,
+		},
+	})
+}
+
+// ============================================================
+// BAGIAN 10: HANDLER - LOGIN
+//
+// Endpoint : POST /api/login
+// Akses    : Publik (tidak perlu token)
+// Body     : { "email": "...", "password": "..." }
+// ============================================================
+
+func login(c *fiber.Ctx) error {
+	var input LoginInput
+
+	if err := c.BodyParser(&input); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"message": "Format body tidak valid.",
+		})
+	}
+
+	if input.Email == "" || input.Password == "" {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"message": "Email dan password wajib diisi.",
+		})
+	}
+
+	// Cari user berdasarkan email
+	var user User
+	if err := DB.Where("email = ?", input.Email).First(&user).Error; err != nil {
+		// Pesan error dibuat umum agar tidak membocorkan info ke hacker
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
+			"success": false,
+			"message": "Email atau password salah.",
+		})
+	}
+
+	// Bandingkan password input dengan hash di database
+	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)); err != nil {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
+			"success": false,
+			"message": "Email atau password salah.",
+		})
+	}
+
+	// Buat token JWT
+	tokenString, expiredAt, err := generateToken(user.ID)
+	if err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"message": "Gagal membuat token.",
+		})
+	}
+
+	return c.Status(http.StatusOK).JSON(fiber.Map{
+		"success": true,
+		"message": "Login berhasil!",
+		"data": fiber.Map{
+			"token":      tokenString,
+			"expired_at": time.Unix(expiredAt, 0).Format("02 Jan 2006, 15:04 WIB"),
+			"user": fiber.Map{
+				"id":    user.ID,
+				"name":  user.Name,
+				"email": user.Email,
+			},
+		},
+	})
+}
+
+// ============================================================
+// BAGIAN 11: HANDLER - DASHBOARD
+//
+// Endpoint : GET /api/dashboard
+// Akses    : Privat (butuh token, dijaga oleh authMiddleware)
+// Header   : Authorization: Bearer <token>
+// ============================================================
+
+func dashboard(c *fiber.Ctx) error {
+	// Ambil user_id yang disimpan oleh authMiddleware
+	userID := c.Locals("user_id").(uint)
+
+	// Ambil data user dari database
+	var user User
+	if err := DB.First(&user, userID).Error; err != nil {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{
+			"success": false,
+			"message": "User tidak ditemukan.",
+		})
+	}
+
+	return c.Status(http.StatusOK).JSON(fiber.Map{
+		"success": true,
+		"message": "Selamat datang di dashboard, " + user.Name + "!",
+		"data": fiber.Map{
+			"user": fiber.Map{
+				"id":           user.ID,
+				"name":         user.Name,
+				"email":        user.Email,
+				"member_since": user.CreatedAt.Format("02 January 2006"),
+			},
+			"stats": fiber.Map{
+				"last_active": time.Now().Format("02 January 2006, 15:04"),
+			},
+		},
+	})
+}
+
+// ============================================================
+// BAGIAN 12: HANDLER - LOGOUT
+//
+// Endpoint : POST /api/logout
+// Akses    : Privat (butuh token, dijaga oleh authMiddleware)
+// Header   : Authorization: Bearer <token>
+//
+// CARA KERJA LOGOUT:
+// Token JWT tidak bisa "dihapus" dari sisi server karena JWT stateless.
+// Solusinya: masukkan token ke "blacklist" di memori server.
+// Setiap request berikutnya dengan token itu akan ditolak oleh middleware.
+// ============================================================
+
+func logout(c *fiber.Ctx) error {
+	// Ambil token dan waktu expired yang sudah disimpan middleware di context
+	tokenString := c.Locals("token").(string)
+	tokenExp := c.Locals("token_exp").(int64)
+
+	// Masukkan token ke daftar hitam
+	// Mulai sekarang, token ini tidak akan bisa dipakai lagi!
+	blacklist.Add(tokenString, tokenExp)
+
+	log.Printf("🔒 User ID %v logout. Token diblacklist hingga %v",
+		c.Locals("user_id"),
+		time.Unix(tokenExp, 0).Format("02 Jan 2006, 15:04"),
+	)
+
+	return c.Status(http.StatusOK).JSON(fiber.Map{
+		"success": true,
+		"message": "Logout berhasil! Token Anda sudah tidak berlaku.",
+	})
+}
+
+// ============================================================
+// BAGIAN 13: MAIN - TITIK AWAL PROGRAM
+// ============================================================
+
+func main() {
+	// Load konfigurasi dari file .env
+	godotenv.Load()
+
+	// Setup JWT secret key
+	jwtSecret = []byte(os.Getenv("JWT_SECRET"))
+	if len(jwtSecret) == 0 {
+		jwtSecret = []byte("rahasia-jwt-ganti-ini-di-production!")
+		log.Println("⚠️  JWT_SECRET tidak ditemukan di .env, menggunakan nilai default.")
+	}
+
+	// Hubungkan ke database
+	connectDatabase()
+
+	// Jalankan goroutine untuk membersihkan blacklist secara berkala
+	// Goroutine = seperti "thread" yang berjalan di background
+	// Setiap 1 jam, hapus token expired dari blacklist agar tidak boros RAM
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		for range ticker.C {
+			blacklist.Cleanup()
+			log.Println("🧹 Blacklist dibersihkan dari token expired.")
+		}
+	}()
+
+	// ============================================================
+	// SETUP FIBER
+	// Fiber adalah web framework yang sangat cepat untuk Go
+	// ============================================================
+	app := fiber.New(fiber.Config{
+		AppName:      "Go Fiber API v1.0",
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			// Handler error global — menangani panic atau error tidak terduga
+			code := http.StatusInternalServerError
+			if e, ok := err.(*fiber.Error); ok {
+				code = e.Code
+			}
+			return c.Status(code).JSON(fiber.Map{
+				"success": false,
+				"message": err.Error(),
+			})
+		},
+	})
+
+	// Middleware global: Logger (tampilkan log setiap request)
+	app.Use(logger.New(logger.Config{
+		Format: "[${time}] ${status} ${method} ${path} - ${latency}\n",
+	}))
+
+	// Middleware global: CORS (izinkan akses dari browser/frontend)
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: "*",
+		AllowHeaders: "Origin, Content-Type, Authorization",
+		AllowMethods: "GET, POST, PUT, DELETE, OPTIONS",
+	}))
+
+	// ============================================================
+	// DAFTAR ROUTES (ENDPOINT API)
+	// ============================================================
+
+	// Health check
+	app.Get("/", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"message": "🚀 Go Fiber API berjalan dengan baik!",
+			"version": "1.0.0",
+		})
+	})
+
+	// Group route dengan prefix /api
+	api := app.Group("/api")
+
+	// --- Route PUBLIK (tidak perlu token) ---
+	api.Post("/register", register) // POST /api/register
+	api.Post("/login", login)       // POST /api/login
+
+	// --- Route PRIVAT (wajib login, ada authMiddleware sebagai penjaga) ---
+	private := api.Group("/", authMiddleware)
+	private.Get("/dashboard", dashboard) // GET  /api/dashboard
+	private.Post("/logout", logout)      // POST /api/logout
+
+	// ============================================================
+	// JALANKAN SERVER
+	// ============================================================
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Printf("🚀 Server berjalan di http://localhost:%s", port)
+	log.Println("📋 Endpoint tersedia:")
+	log.Println("   GET  /               → Health check")
+	log.Println("   POST /api/register   → Daftar akun baru")
+	log.Println("   POST /api/login      → Login")
+	log.Println("   GET  /api/dashboard  → Dashboard  [🔒 butuh token]")
+	log.Println("   POST /api/logout     → Logout     [🔒 butuh token]")
+	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+	if err := app.Listen(":" + port); err != nil {
+		log.Fatal("❌ Server gagal berjalan:", err)
+	}
+}
